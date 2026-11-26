@@ -1,10 +1,10 @@
 param([string]$Kind, [string]$Format, [string]$Batch)
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 . (Join-Path $PSScriptRoot 'core.ps1')
 
 $script:title = T 'Convert'
-$script:icon = [Drawing.SystemIcons]::Application
+$script:icon = New-Object Drawing.Icon (Join-Path $PSScriptRoot 'explorer-convert.ico')
 $script:window = $null
 $script:notify = $null
 
@@ -15,82 +15,121 @@ $decoy.Opacity = 0
 $decoy.Show()
 $decoy.Dispose()
 
-function New-Window([int]$width, [int]$height) {
-    $form = New-Object Windows.Forms.Form
-    $form.Text = $script:title
-    $form.ClientSize = New-Object Drawing.Size $width, $height
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-    $form.StartPosition = 'CenterScreen'
-    $form.Font = [Drawing.SystemFonts]::MessageBoxFont
-    $form.TopMost = $true
-    $form.Add_Shown({ $this.Activate(); $this.TopMost = $false })
-    $form
+# Colors follow the Windows app theme
+$personalize = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue
+$script:dark = $personalize.AppsUseLightTheme -eq 0
+$script:colors = if ($script:dark) {
+    @{ Back = '#222226'; Card = '#343437'; Field = '#454549'; Off = '#5A5A5F'; Text = '#FFFFFF'; Accent = '#5B67CF' }
+} else {
+    @{ Back = '#FAFAFB'; Card = '#FFFFFF'; Field = '#EDEDF0'; Off = '#B9B9C0'; Text = '#2E2E32'; Accent = '#5B67CF' }
+}
+$script:xaml = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'window.xaml'))
+if ($script:dark) {
+    Add-Type -Namespace ExplorerConvert -Name Dwm -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);'
 }
 
-function Add-Control($form, [string]$type, [int]$x, [int]$y, [int]$width, [int]$height, [string]$text) {
-    $control = New-Object "Windows.Forms.$type"
-    $control.SetBounds($x, $y, $width, $height)
-    $control.Text = $text
-    $form.Controls.Add($control)
+function New-Window([string]$heading, [string]$status) {
+    $window = [Windows.Markup.XamlReader]::Parse($script:xaml)
+    foreach ($name in $script:colors.Keys) {
+        $window.Resources[$name] = (New-Object Windows.Media.BrushConverter).ConvertFromString($script:colors[$name])
+    }
+    $decoder = [Windows.Media.Imaging.BitmapDecoder]::Create([Uri](Join-Path $PSScriptRoot 'explorer-convert.ico'), 'None', 'OnLoad')
+    $window.Icon = $decoder.Frames[0]
+    $window.FindName('Logo').Source = $decoder.Frames | Sort-Object PixelWidth | Select-Object -Last 1
+    $window.Title = $script:title
+    $window.FindName('Heading').Text = $heading
+    $window.FindName('Status').Text = $status
+    $window.MaxHeight = [Windows.SystemParameters]::WorkArea.Height
+    $window.Topmost = $true
+    $window.Add_ContentRendered({ [void]$this.Activate(); $this.Topmost = $false })
+    if ($script:dark) {
+        # 20 is DWMWA_USE_IMMERSIVE_DARK_MODE; older Windows 10 ignores it
+        $window.Add_SourceInitialized({
+            $on = 1
+            $handle = (New-Object Windows.Interop.WindowInteropHelper $this).Handle
+            [void][ExplorerConvert.Dwm]::DwmSetWindowAttribute($handle, 20, [ref]$on, 4)
+        })
+    }
+    $window
+}
+
+function Add-Card($window) {
+    $card = New-Object Windows.Controls.Border
+    $card.CornerRadius = New-Object Windows.CornerRadius 12
+    $card.Padding = New-Object Windows.Thickness 14, 4, 14, 4
+    $card.Margin = New-Object Windows.Thickness 0, 0, 0, 16
+    $card.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Card')
+    $card.Child = New-Object Windows.Controls.StackPanel
+    [void]$window.FindName('Body').Children.Add($card)
+    $card.Child
+}
+
+function Add-Row($card, [string]$label, [string]$type) {
+    $row = New-Object Windows.Controls.DockPanel
+    $row.Margin = New-Object Windows.Thickness 0, 7, 0, 7
+    $control = New-Object "Windows.Controls.$type"
+    [Windows.Automation.AutomationProperties]::SetName($control, $label)
+    if ($type -ne 'CheckBox') { $control.Width = 190 }
+    [Windows.Controls.DockPanel]::SetDock($control, 'Right')
+    $text = New-Object Windows.Controls.TextBlock
+    $text.Text = $label
+    $text.VerticalAlignment = 'Center'
+    $text.TextWrapping = 'Wrap'
+    $text.Margin = New-Object Windows.Thickness 0, 0, 12, 0
+    [void]$row.Children.Add($control)
+    [void]$row.Children.Add($text)
+    [void]$card.Children.Add($row)
     $control
 }
 
-function Show-Options([string]$kind, [string[]]$formats, $saved, [int]$count) {
-    $form = New-Window 420 100
-    $script:optionsY = 12
-    [void](Add-Control $form Label 12 $script:optionsY 396 22 "$(T 'Selected files'): $count")
-    $script:optionsY += 30
+function Add-Button($window, [string]$text, [bool]$accent) {
+    $button = New-Object Windows.Controls.Button
+    $button.Content = $text
+    $button.HorizontalAlignment = 'Center'
+    if ($accent) {
+        $button.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'Accent')
+        $button.Foreground = [Windows.Media.Brushes]::White
+    }
+    [void]$window.FindName('Body').Children.Add($button)
+    $button
+}
 
-    function Add-Row([string]$label, [string]$type) {
-        $l = Add-Control $form Label 12 ($script:optionsY + 3) 170 22 "${label}:"
-        $l.AutoEllipsis = $true
-        $c = Add-Control $form $type 186 $script:optionsY 222 24 ''
-        $c.AccessibleName = $label
-        $script:optionsY += 32
-        $c
-    }
-    function Add-Combo([string]$label, [string[]]$items, [int]$selected) {
-        $c = Add-Row $label ComboBox
-        $c.DropDownStyle = 'DropDownList'
-        [void]$c.Items.AddRange($items)
+function Show-Options([string]$kind, [string[]]$formats, $saved, [int]$count) {
+    $window = New-Window $script:title "$(T 'Selected files'): $count"
+    function Add-Combo($card, [string]$label, [string[]]$items, [int]$selected) {
+        $c = Add-Row $card $label ComboBox
+        foreach ($item in $items) { [void]$c.Items.Add($item) }
         $c.SelectedIndex = $selected
-        $c
-    }
-    function Add-Check([string]$label, [bool]$checked) {
-        $c = Add-Control $form CheckBox 12 $script:optionsY 396 24 $label
-        $c.Checked = $checked
-        $script:optionsY += 28
         $c
     }
 
     $heights = 0, 1080, 720, 480
-    $formatBox = Add-Combo (T 'Format') @($formats | ForEach-Object { Get-Label $kind $_ }) ([array]::IndexOf($formats, $saved.Format))
-    $qualityBox = Add-Combo (T 'Quality') @((T 'High'), (T 'Normal'), (T 'Small file')) $saved.Quality
     $heightBox = $startBox = $endBox = $sizeBox = $gpuBox = $null
-    if ($kind -in 'video', 'image') { $heightBox = Add-Combo (T 'Max height') @((T 'Original'), '1080', '720', '480') ([array]::IndexOf($heights, $saved.Height)) }
+    $card = Add-Card $window
+    $formatBox = Add-Combo $card (T 'Format') @($formats | ForEach-Object { Get-Label $kind $_ }) ([array]::IndexOf($formats, $saved.Format))
+    $qualityBox = Add-Combo $card (T 'Quality') @((T 'High'), (T 'Normal'), (T 'Small file')) $saved.Quality
+    if ($kind -in 'video', 'image') { $heightBox = Add-Combo $card (T 'Max height') @((T 'Original'), '1080', '720', '480') ([array]::IndexOf($heights, $saved.Height)) }
     if ($kind -in 'video', 'audio') {
-        $startBox = Add-Row "$(T 'Start') (0:15)" TextBox
-        $endBox = Add-Row "$(T 'End') (1:30)" TextBox
+        $card = Add-Card $window
+        $startBox = Add-Row $card "$(T 'Start') (0:15)" TextBox
+        $endBox = Add-Row $card "$(T 'End') (1:30)" TextBox
+        if ($kind -eq 'video') { $sizeBox = Add-Row $card (T 'Target size, MB') TextBox }
     }
+    $card = Add-Card $window
     if ($kind -eq 'video') {
-        $sizeBox = Add-Row (T 'Target size, MB') TextBox
-        $gpuBox = Add-Check (T 'Use GPU') $saved.Gpu
+        $gpuBox = Add-Row $card (T 'Use GPU') CheckBox
+        $gpuBox.IsChecked = $saved.Gpu
     }
-    $stripBox = Add-Check (T 'Remove metadata') $saved.Strip
+    $stripBox = Add-Row $card (T 'Remove metadata') CheckBox
+    $stripBox.IsChecked = $saved.Strip
 
-    $ok = Add-Control $form Button 308 ($script:optionsY + 8) 100 28 'OK'
-    $ok.DialogResult = 'OK'
-    $form.AcceptButton = $ok
-    $form.CancelButton = New-Object Windows.Forms.Button  # Escape closes the dialog
-    $form.CancelButton.DialogResult = 'Cancel'
-    $form.CancelButton.SetBounds(-100, -100, 10, 10)
-    $form.CancelButton.TabStop = $false
-    $form.Controls.Add($form.CancelButton)
-    $form.ClientSize = New-Object Drawing.Size 420, ($script:optionsY + 48)
-    $result = $form.ShowDialog()
-    $form.Dispose()
-    if ($result -ne 'OK') { return $null }
+    $ok = Add-Button $window (T 'Convert') $true
+    $ok.IsDefault = $true
+    $ok.Add_Click({ [Windows.Window]::GetWindow($this).DialogResult = $true })
+    $window.Add_PreviewKeyDown({
+        if ($_.Key -eq 'Escape' -and -not ($_.OriginalSource -is [Windows.Controls.ComboBoxItem])) { $this.Close() }
+    })
+    if (-not $window.ShowDialog()) { return $null }
 
     $text = { param($box) if ($box) { $box.Text.Trim() } else { '' } }
     @{
@@ -100,33 +139,38 @@ function Show-Options([string]$kind, [string[]]$formats, $saved, [int]$count) {
         Start = & $text $startBox
         End = & $text $endBox
         Size = & $text $sizeBox
-        Gpu = [bool]($gpuBox -and $gpuBox.Checked)
-        Strip = $stripBox.Checked
+        Gpu = [bool]($gpuBox -and $gpuBox.IsChecked)
+        Strip = [bool]$stripBox.IsChecked
     }
 }
 
 function Update-Progress([int]$percent, [string]$text) {
     if (-not $script:window) {
         $script:canceled = $false
-        $script:window = New-Window 420 112
-        $script:label = Add-Control $script:window Label 12 12 396 22 (T 'Converting')
-        $script:label.AutoEllipsis = $true
-        $script:label.UseMnemonic = $false
-        $script:bar = Add-Control $script:window ProgressBar 12 38 396 22 ''
-        $cancel = Add-Control $script:window Button 308 72 100 28 (T 'Cancel')
+        $script:closing = $false
+        $script:window = New-Window (T 'Converting') ''
+        $script:bar = New-Object Windows.Controls.ProgressBar
+        $script:bar.Margin = New-Object Windows.Thickness 0, 0, 0, 20
+        [void]$script:window.FindName('Body').Children.Add($script:bar)
+        $cancel = Add-Button $script:window (T 'Cancel') $false
+        $cancel.IsCancel = $true
         $cancel.Add_Click({ $script:canceled = $true })
-        $script:window.CancelButton = $cancel
-        $script:window.Add_FormClosing({ $script:canceled = $true; $_.Cancel = $true })
+        $script:window.Add_Closing({ if (-not $script:closing) { $script:canceled = $true; $_.Cancel = $true } })
         $script:window.Show()
     }
-    if ($script:label.Text -ne $text) { $script:label.Text = $text }
-    if ($script:bar.Value -ne $percent) { $script:bar.Value = $percent }
-    [Windows.Forms.Application]::DoEvents()
+    $script:window.FindName('Status').Text = $text
+    $script:bar.Value = $percent
+    # Handles everything queued above background priority, like DoEvents
+    $script:window.Dispatcher.Invoke([Action]{ }, [Windows.Threading.DispatcherPriority]::Background)
     $script:canceled
 }
 
 function Close-Progress {
-    if ($script:window) { $script:window.Dispose(); $script:window = $null }
+    if ($script:window) {
+        $script:closing = $true
+        $script:window.Close()
+        $script:window = $null
+    }
 }
 
 function Show-Done([string]$text, [string]$file) {
@@ -149,18 +193,21 @@ function Show-Done([string]$text, [string]$file) {
 
 function Show-Error([string]$text) {
     Close-Progress
-    $form = New-Window 560 260
-    $box = Add-Control $form TextBox 12 12 536 198 $text
-    $box.Multiline = $true
-    $box.ReadOnly = $true
-    $box.ScrollBars = 'Vertical'
-    $box.Select(0, 0)
-    $ok = Add-Control $form Button 448 220 100 28 'OK'
-    $ok.DialogResult = 'OK'
-    $form.AcceptButton = $form.CancelButton = $ok
-    $form.ActiveControl = $ok
-    [void]$form.ShowDialog()
-    $form.Dispose()
+    $window = New-Window (T 'Failed') ''
+    $window.Width = 560
+    $box = New-Object Windows.Controls.TextBox
+    $box.Text = $text
+    $box.IsReadOnly = $true
+    $box.TextWrapping = 'Wrap'
+    $box.MaxHeight = 260
+    $box.VerticalScrollBarVisibility = 'Auto'
+    $box.Margin = New-Object Windows.Thickness 0, 0, 0, 16
+    [void]$window.FindName('Body').Children.Add($box)
+    $ok = Add-Button $window 'OK' $true
+    $ok.IsDefault = $ok.IsCancel = $true
+    $ok.Add_Click({ [Windows.Window]::GetWindow($this).Close() })
+    $window.Add_Loaded({ [void]$this.MoveFocus((New-Object Windows.Input.TraversalRequest Last)) })
+    [void]$window.ShowDialog()
 }
 
 # Above 100 selected files Explorer passes only one of them, so ask it for the rest

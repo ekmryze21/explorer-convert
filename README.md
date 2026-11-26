@@ -1,3 +1,5 @@
+<img src="explorer-convert.svg" width="96" alt="">
+
 # explorer-convert
 
 Adds a **Convert to…** submenu to the Windows Explorer context menu for video, audio, images, PDF and office documents. Results are saved next to the originals, which are never modified or overwritten.
@@ -47,7 +49,7 @@ The tools' own installers may ask for administrator rights; explorer-convert its
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-This changes the execution policy for that one command only. The program is copied to `%LOCALAPPDATA%\explorer-convert` and the menu is registered for the current user. Any missing tool is listed with the command that installs it. After a system language change, run the installer again to update the menu names.
+This changes the execution policy for that one command only. The program is copied to `%LOCALAPPDATA%\explorer-convert` and the menu is registered for the current user. Any missing tool is listed with the command that installs it. After changing the system language or switching between light and dark mode, run the installer again to update the menu.
 
 ## Notes
 

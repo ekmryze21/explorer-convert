@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Stop'
 $script:root = $PSScriptRoot
 $script:tmp = $null
 
-$lang = if ($env:EXPLORER_CONVERT_LANG) { $env:EXPLORER_CONVERT_LANG } else { [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName }
-$script:tr = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'lang.json')) | ConvertFrom-Json).$lang
+$script:locale = if ($env:EXPLORER_CONVERT_LANG) { $env:EXPLORER_CONVERT_LANG } else { [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName }
+$script:tr = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'lang.json')) | ConvertFrom-Json).($script:locale)
 function T([string]$text) { if ($script:tr.$text) { $script:tr.$text } else { $text } }
 
 # Digits are padded so that page2 sorts before page10
@@ -28,14 +28,53 @@ function Read-Batch([string]$folder) {
     @(Get-PageOrder $paths)
 }
 
+# A terminal opened before an installation has the old PATH, and some installers do not touch PATH at all
+function Add-SearchPath {
+    $dirs = @('Machine', 'User' | ForEach-Object { "$([Environment]::GetEnvironmentVariable('Path', $_))" -split ';' })
+    foreach ($base in $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
+        if (-not $base) { continue }
+        $dirs += "$base\LibreOffice\program", "$base\Tesseract-OCR", "$base\Calibre2"
+        foreach ($gs in @(Get-Item "$base\gs\gs*\bin" -ErrorAction Ignore)) { $dirs += $gs.FullName }
+    }
+    if ($env:LOCALAPPDATA) {
+        foreach ($py in @(Get-Item "$env:LOCALAPPDATA\Programs\Python\Python3*\Scripts" -ErrorAction Ignore)) { $dirs += $py.FullName }
+    }
+    $known = $env:PATH -split ';'
+    foreach ($dir in $dirs) {
+        if ($dir -and $dir -notin $known -and [IO.Directory]::Exists($dir)) { $known += $dir }
+    }
+    $env:PATH = $known -join ';'
+}
+if ($env:OS -eq 'Windows_NT' -and -not $env:EXPLORER_CONVERT_NO_SEARCH) { Add-SearchPath }
+
 function Find-Tool([string]$name) {
-    $found = Get-Command $name -CommandType Application -ErrorAction Ignore | Select-Object -First 1
-    if ($found) { return $found.Source }
-    if ($name -eq 'soffice') {
-        foreach ($dir in $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
-            $path = "$dir\LibreOffice\program\soffice.com"
-            if ($dir -and [IO.File]::Exists($path)) { return $path }
+    $names = if ($name -eq 'gs') { 'gswin64c', 'gswin32c', 'gs' } else { , $name }
+    foreach ($n in $names) {
+        $found = Get-Command $n -CommandType Application -ErrorAction Ignore | Select-Object -First 1
+        if ($found) { return $found.Source }
+    }
+}
+
+function Get-ActionTools([string]$kind, [string]$format) {
+    switch ($kind) {
+        { $_ -in 'video', 'audio' } { 'ffmpeg', 'ffprobe' }
+        image {
+            'magick'
+            if ($format -eq 'avif') { 'ffmpeg' }
+            if ($format -eq 'pdf-one') { 'pdfunite' }
         }
+        pdf {
+            switch ($format) {
+                txt { 'pdftotext' }
+                merge { 'pdfunite' }
+                split { 'pdfseparate' }
+                compress { 'gs' }
+                ocr { 'ocrmypdf', 'tesseract' }
+                default { 'pdftoppm' }
+            }
+        }
+        office { 'soffice' }
+        ebook { 'ebook-convert' }
     }
 }
 
@@ -124,6 +163,28 @@ function Get-Formats([string]$kind) {
         image { 'jpg', 'png', 'webp', 'avif', 'jxl', 'tiff', 'gif', 'bmp', 'ico', 'pdf', 'pdf-one' }
         pdf { 'png', 'jpg', 'txt' }
         office { 'pdf', 'docx', 'odt', 'xlsx', 'ods', 'csv', 'pptx', 'odp' }
+        ebook { 'epub', 'mobi', 'azw3', 'pdf', 'txt' }
+    }
+}
+
+# Menu-only, not offered in the form
+function Get-Actions([string]$kind) {
+    switch ($kind) {
+        video { 'mute', 'rotate-left', 'rotate-right', 'srt' }
+        pdf { 'merge', 'split', 'compress', 'ocr' }
+    }
+}
+
+# Some ffmpeg builds lack the patented encoders
+function Assert-Encoder([string]$kind) {
+    $encoders = @{
+        h264 = 'libx264'; h265 = 'libx265'; av1 = 'libsvtav1'; vp9 = 'libvpx-vp9'; mp3 = 'libmp3lame'; opus = 'libopus'
+        ogg = 'libvorbis'; avif = 'libaom-av1'; 'rotate-left' = 'libx264'; 'rotate-right' = 'libx264'
+    }
+    $encoder = $encoders[$script:format]
+    if (-not $encoder -or $kind -notin 'video', 'audio', 'image') { return }
+    if (0 -eq (Invoke-Tool ffmpeg '-hide_banner', '-encoders') -and $script:stdout -notmatch " $encoder ") {
+        throw [ApplicationException]"$(T 'ffmpeg was built without an encoder'): $encoder"
     }
 }
 
@@ -242,6 +303,10 @@ function Convert-Media {
     if ($o.Height -gt 0) { $vf = "scale=-2:min($($o.Height)\,ih),$vf" }
     if ($o.Size) { return Convert-ToSize $source $vf }
 
+    if ($script:format -eq 'srt' -and -not (Invoke-Probe '-select_streams', 's', '-show_entries', 'stream=index')) {
+        $script:err = 'No subtitles'
+        return $false
+    }
     $aac = '-c:a', 'aac', '-movflags', '+faststart'
     $rate = ('256k', '192k', '128k')[$q]
     $arguments = switch ($script:format) {
@@ -250,6 +315,10 @@ function Convert-Media {
         av1 { @('-vf', $vf, '-c:v', 'libsvtav1', '-preset', '8', '-crf', (26, 32, 40)[$q], '-pix_fmt', 'yuv420p') + $aac }
         vp9 { '-vf', $vf, '-c:v', 'libvpx-vp9', '-crf', (28, 34, 40)[$q], '-b:v', '0', '-row-mt', '1', '-cpu-used', '4', '-pix_fmt', 'yuv420p', '-c:a', 'libopus' }
         gif { '-vf', "$vf,fps=$((20, 15, 10)[$q]),split[a][b];[a]palettegen[p];[b][p]paletteuse" }
+        rotate-left { @('-vf', "transpose=cclock,$vf", '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p') + $aac }
+        rotate-right { @('-vf', "transpose=clock,$vf", '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p') + $aac }
+        mute { '-map', '0:V', '-map', '0:s?', '-c', 'copy' }
+        srt { '-map', '0:s:0', '-c:s', 'srt' }  # first track only
         copy-mp4 { '-map', '0:V', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart' }
         copy-mkv { '-map', '0:V', '-map', '0:a?', '-map', '0:s?', '-map', '0:t?', '-c', 'copy' }
         mp3 { '-vn', '-c:a', 'libmp3lame', '-b:a', $rate }
@@ -270,13 +339,20 @@ function Convert-Media {
     Invoke-Ffmpeg ($source + $arguments + @($script:part))
 }
 
+# A read-only copy could be neither replaced nor deleted
+function Copy-Source([string]$name) {
+    $path = Join-Path $script:tmp $name
+    [IO.File]::Copy($script:file, $path, $true)
+    [IO.File]::SetAttributes($path, 'Normal')
+}
+
 # The source is copied under a plain name: magick parses [], : and % in paths
 function Convert-Image {
     $o = $script:opt
     $q = $o.Quality
     $src = 'in'
     if ($script:name -match '.\.([A-Za-z0-9]+)$') { $src += '.' + $Matches[1].ToLowerInvariant() }
-    [IO.File]::Copy($script:file, (Join-Path $script:tmp $src), $true)
+    Copy-Source $src
     if ($src -eq 'in.avif') {
         if (-not (Invoke-Ffmpeg '-i', $src, '-frames:v', '1', 'decoded.png')) { return $false }
         $src = 'decoded.png'
@@ -301,26 +377,59 @@ function Convert-Image {
 
 # Poppler gets plain relative names, its Windows builds read arguments in the ANSI code page
 function Convert-Pdf {
-    [IO.File]::Copy($script:file, (Join-Path $script:tmp 'in.pdf'), $true)
-    if ($script:format -eq 'txt') {
-        return 0 -eq (Invoke-Tool pdftotext '-layout', 'in.pdf', '-' -OutFile $script:part)
+    Copy-Source 'in.pdf'
+    $in = Join-Path $script:tmp 'in.pdf'
+    $result = Join-Path $script:tmp 'out.pdf'
+    Remove-Path $result
+    switch ($script:format) {
+        txt { return 0 -eq (Invoke-Tool pdftotext '-layout', 'in.pdf', '-' -OutFile $script:part) }
+        merge {
+            [IO.File]::Copy($in, $script:part)
+            return $true
+        }
+        compress {
+            if (0 -ne (Invoke-Tool gs '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', '-sOutputFile=out.pdf', '-f', 'in.pdf')) { return $false }
+            if ((New-Object IO.FileInfo $result).Length -ge (New-Object IO.FileInfo $in).Length) {
+                $script:err = 'Already compressed'
+                return $false
+            }
+            [IO.File]::Copy($result, $script:part)
+            return $true
+        }
+        ocr {
+            $data = @{ uk = 'ukr'; de = 'deu'; es = 'spa'; fr = 'fra'; pl = 'pol'; nl = 'nld'; ca = 'cat' }[$script:locale]
+            # English always, Ukrainian and the system language if Tesseract has data for them
+            [void](Invoke-Tool tesseract '--list-langs')
+            $installed = $script:stdout -split '\s+'
+            $languages = (@('eng') + @('ukr', $data | Where-Object { $_ -and $_ -in $installed } | Select-Object -Unique)) -join '+'
+            if (0 -ne (Invoke-Tool ocrmypdf '--skip-text', '-l', $languages, 'in.pdf', 'out.pdf')) { return $false }
+            [IO.File]::Copy($result, $script:part)
+            return $true
+        }
     }
     $pages = Join-Path $script:tmp 'pages'
     if ([IO.Directory]::Exists($pages)) { [IO.Directory]::Delete($pages, $true) }
     [void][IO.Directory]::CreateDirectory($pages)
-    $flag = if ($script:format -eq 'jpg') { '-jpeg' } else { '-png' }
-    if (0 -ne (Invoke-Tool pdftoppm $flag, '-r', '150', 'in.pdf', 'pages/page')) { return $false }
+    $code = switch ($script:format) {
+        split { Invoke-Tool pdfseparate 'in.pdf', 'pages/page-%03d.pdf' }
+        jpg { Invoke-Tool pdftoppm '-jpeg', '-r', '150', 'in.pdf', 'pages/page' }
+        default { Invoke-Tool pdftoppm '-png', '-r', '150', 'in.pdf', 'pages/page' }
+    }
+    if ($code -ne 0) { return $false }
     $files = [IO.Directory]::GetFiles($pages)
     if ($files.Count -eq 0) { return $false }
-    if ($files.Count -eq 1) {
+    if ($files.Count -eq 1 -and $script:format -ne 'split') {
         [IO.File]::Copy($files[0], $script:part)
-        $script:out = Get-FreeName ".$($script:ext)"
+        $script:suffix = ".$($script:ext)"
+        $script:out = Get-FreeName $script:suffix
         return $true
     }
     [void][IO.Directory]::CreateDirectory($script:part)
     foreach ($f in $files) { [IO.File]::Copy($f, (Join-Path $script:part ([IO.Path]::GetFileName($f)))) }
     $true
 }
+
+function Convert-Ebook { 0 -eq (Invoke-Tool ebook-convert $script:file, $script:part) }
 
 # soffice names its own output, so use a scratch folder and a private profile
 function Convert-Office {
@@ -357,25 +466,38 @@ function Remove-Path([string]$path) {
     }
 }
 
-function Move-Result([string]$from, [string]$to) {
-    if ([IO.Directory]::Exists($from)) { [IO.Directory]::Move($from, $to) } else { [IO.File]::Move($from, $to) }
+# Another conversion of the same file may have taken the name meanwhile
+function Save-Result {
+    while ($true) {
+        try {
+            if ([IO.Directory]::Exists($script:part)) { [IO.Directory]::Move($script:part, $script:out) } else { [IO.File]::Move($script:part, $script:out) }
+            break
+        } catch {
+            if (-not (Test-Exists $script:out)) { throw }
+            $script:out = Get-FreeName $script:suffix
+        }
+    }
+    $script:lastOut = $script:out
 }
 
 function Get-ErrorText {
     if ($script:err) { return T $script:err }
-    "$($script:log)".Trim() -split "`r?`n" | Select-Object -Last 1
+    # Ghostscript reports errors on stdout
+    $text = "$($script:log)".Trim()
+    if (-not $text) { $text = "$($script:stdout)".Trim() }
+    $text -split "`r?`n" | Select-Object -Last 1
 }
 
 function Invoke-Files([string]$kind, [string[]]$files) {
-    $merge = $script:format -eq 'pdf-one'
-    if ($merge) { $script:format = 'pdf' }
+    $merge = $script:format -in 'pdf-one', 'merge'
+    if ($script:format -eq 'pdf-one') { $script:format = 'pdf' }
     $script:ext = switch ($script:format) {
-        { $_ -in 'h264', 'h265', 'av1', 'copy-mp4' } { 'mp4' }
+        { $_ -in 'h264', 'h265', 'av1', 'copy-mp4', 'rotate-left', 'rotate-right' } { 'mp4' }
         vp9 { 'webm' }
         copy-mkv { 'mkv' }
+        { $_ -in 'merge', 'split', 'compress', 'ocr' } { 'pdf' }
         default { $script:format }
     }
-    $suffix = if ($kind -eq 'pdf' -and $script:format -ne 'txt') { '' } else { ".$($script:ext)" }
     $failed = @()
     $merged = @()
     $script:total = $files.Count
@@ -383,6 +505,7 @@ function Invoke-Files([string]$kind, [string[]]$files) {
     $script:clipUs = [long]0
     $script:name = [IO.Path]::GetFileName($files[0])
 
+    Assert-Encoder $kind
     $script:gpu = $null
     if ($script:opt.Gpu -and -not $script:opt.Size -and $script:format -in 'h264', 'h265') {
         $script:codec = $script:format -replace 'h265', 'hevc'
@@ -397,9 +520,14 @@ function Invoke-Files([string]$kind, [string[]]$files) {
         if (-not $stem) { $stem = $script:name }
         $script:base = Join-Path $dir $stem
         if ($script:index -eq 0) { $mergeBase = $script:base }
-        $script:out = Get-FreeName $suffix
+        if ($script:format -eq 'mute') {
+            $script:ext = [IO.Path]::GetExtension($f).TrimStart('.').ToLowerInvariant()
+            if ($script:ext -notin 'mp4', 'mov', 'mkv', 'webm') { $script:ext = 'mkv' }
+        }
+        $script:suffix = if ($kind -eq 'pdf' -and $script:format -in 'png', 'jpg', 'split') { '' } else { ".$($script:ext)" }
+        $script:out = Get-FreeName $script:suffix
         $script:part = Join-Path $dir ".explorer-convert-$PID.$($script:ext)"
-        $script:err = $script:log = ''
+        $script:err = $script:log = $script:stdout = ''
         $script:clipUs = [long]0
         $script:passBase = 0
         $script:passSpan = 100
@@ -408,6 +536,7 @@ function Invoke-Files([string]$kind, [string[]]$files) {
                 image { Convert-Image }
                 pdf { Convert-Pdf }
                 office { Convert-Office }
+                ebook { Convert-Ebook }
                 default { Convert-Media }
             }
             if ($ok) {
@@ -416,8 +545,7 @@ function Invoke-Files([string]$kind, [string[]]$files) {
                     [IO.File]::Copy($script:part, (Join-Path $script:tmp $page))
                     $merged += $page
                 } else {
-                    Move-Result $script:part $script:out
-                    $script:lastOut = $script:out
+                    Save-Result
                 }
                 $script:done++
             } else { $failed += "$($script:name): $(Get-ErrorText)" }
@@ -436,7 +564,8 @@ function Invoke-Files([string]$kind, [string[]]$files) {
         if (-not $failed) {
             $script:index = $script:total - 1
             $script:base = $mergeBase
-            $script:out = Get-FreeName '.pdf'
+            $script:suffix = '.pdf'
+            $script:out = Get-FreeName $script:suffix
             $script:part = Join-Path ([IO.Path]::GetDirectoryName($mergeBase)) ".explorer-convert-$PID.pdf"
             try {
                 # One page at a time would be quadratic; groups keep the command line short
@@ -451,8 +580,7 @@ function Invoke-Files([string]$kind, [string[]]$files) {
                     $merged = $next
                 }
                 [IO.File]::Copy((Join-Path $script:tmp $merged[0]), $script:part)
-                Move-Result $script:part $script:out
-                $script:lastOut = $script:out
+                Save-Result
                 $script:done = $script:total
             } catch [OperationCanceledException] {
                 throw
@@ -481,18 +609,12 @@ function Invoke-Convert([string]$kind, [string]$format, [string[]]$files) {
             $script:opt.Height = 720
             $script:opt.Size = '10'
         }
-        if ($format -notin @(Get-Formats $kind)) { throw [ApplicationException]"Unknown action: $kind $format" }
+        if ($format -notin @(Get-Formats $kind) + @(Get-Actions $kind)) { throw [ApplicationException]"Unknown action: $kind $format" }
         $script:format = $format
-        switch ($kind) {
-            { $_ -in 'video', 'audio' } { Assert-Tool ffmpeg ffprobe }
-            image {
-                Assert-Tool magick
-                if ($format -eq 'avif' -or $files -match '\.avif$') { Assert-Tool ffmpeg }
-                if ($format -eq 'pdf-one') { Assert-Tool pdfunite }
-            }
-            pdf { if ($format -eq 'txt') { Assert-Tool pdftotext } else { Assert-Tool pdftoppm } }
-            office { Assert-Tool soffice }
-        }
+        $tools = @(Get-ActionTools $kind $format)
+        if ($kind -eq 'image' -and $files -match '\.avif$') { $tools += 'ffmpeg' }
+        Assert-Tool @tools
+        if ($format -eq 'merge' -and $files.Count -lt 2) { throw [ApplicationException](T 'Select several files') }
         $o = $script:opt
         $o.StartUs = $o.EndUs = [long]0
         if ($o.Start) { $o.StartUs = ConvertTo-Us $o.Start }

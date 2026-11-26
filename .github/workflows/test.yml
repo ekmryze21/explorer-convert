@@ -1,0 +1,40 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows open
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Only the functions: the script itself ends with a real conversion
+          $source = [IO.File]::ReadAllText("$pwd\explorer-convert.ps1")
+          $source = $source.Substring(0, $source.IndexOf("`ntry {"))
+          [IO.File]::WriteAllText("$pwd\smoke.ps1", $source + @'
+
+          $saved = @{ Format = 'h264'; Quality = 1; Height = 0; Gpu = $false; Strip = $true }
+          $timer = New-Object Windows.Threading.DispatcherTimer
+          $timer.Interval = [TimeSpan]::FromSeconds(3)
+          $timer.Add_Tick({ $this.Stop(); foreach ($w in [Windows.Interop.HwndSource]::CurrentSources) { if ($w.RootVisual -is [Windows.Window]) { $w.RootVisual.DialogResult = $true } } })
+          $timer.Start()
+          $choice = Show-Options video @(Get-Formats video) $saved 2
+          if ($choice.Format -ne 'h264' -or -not $choice.Strip) { throw 'options' }
+          if (Update-Progress 40 'test') { throw 'progress' }
+          Close-Progress
+          'windows ok'
+          '@)
+          powershell -NoProfile -Sta -ExecutionPolicy Bypass -File smoke.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Installer
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File test-install.ps1
+      - name: Tools
+        run: choco install -y --no-progress ffmpeg imagemagick poppler
+      - run: |
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"; Update-SessionEnvironment
+          powershell -NoProfile -ExecutionPolicy Bypass -File test.ps1
