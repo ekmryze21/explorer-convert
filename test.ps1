@@ -210,7 +210,7 @@ $name = Join-Path $PSScriptRoot ("$Kind-$Format." + [Guid]::NewGuid())
     Make ffmpeg long.mkv '-v error -f lavfi -i testsrc=d=120:s=1920x1080 -c:v mpeg4 gen.mkv'
     $script:cancelWhen = { ($script:progress | Select-Object -Last 1) -match '\(([1-9]|[1-9]\d)%\)$' }
     Go video h264 long.mkv
-    Check 'cancel' ($rc -eq 1 -and $doneText -eq 'Canceled. Done: 0' -and -not (Has long.mp4) -and
+    Check "cancel ($rc, $doneText, $errorText)" ($rc -eq 1 -and $doneText -eq 'Canceled. Done: 0' -and -not (Has long.mp4) -and
         -not (Get-Process ffmpeg -ErrorAction Ignore))
     $script:cancelWhen = $null
 

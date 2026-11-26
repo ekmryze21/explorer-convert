@@ -34,7 +34,7 @@ jobs:
       - name: Installer
         run: powershell -NoProfile -ExecutionPolicy Bypass -File test-install.ps1
       - name: Tools
-        run: choco install -y --no-progress ffmpeg imagemagick poppler
+        run: choco install -y --no-progress ffmpeg-full imagemagick poppler
       - run: |
           Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"; Update-SessionEnvironment
           powershell -NoProfile -ExecutionPolicy Bypass -File test.ps1
